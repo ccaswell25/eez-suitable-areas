@@ -1,0 +1,330 @@
+---
+title: "Modeling Suitable Growth Areas for Marine Species on the West Coast of the United States"
+description: "Determining growth suitability for developing marine aquaculture on the West Coast the United States Exclusive Economic Zones (EEZ)."
+author: "Carly  Caswell"
+date: "2023-28-11"
+output:
+    html_document:
+      print_df: paged
+      toc: yes
+      toc_depth: 4
+      toc_float: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+getwd()
+```
+
+## Overview
+
+"As the human population looks set to reach 10 billion people by 2050, our food systems will be under intense pressure to produce animal protein for an increasing population,"(Gentry). This is an important problem to consider because, with scarcity of animal-rich protein sources, we need to turn to other alternatives. This is where marine aquaculture can play an important role, which is defined as the breeding, rearing, and harvesting of aquatic plants and animals (NOAA). Sustainable seafood production can be a signfiicant contributor to this global food supply crisis, and in order to plan for future marine aquaculture projects and initiatives, we need to consider a few important implications, such as ocean depth, temperatures, logistics traffic, protected areas, etc.
+
+In this analysis, given a species input, I am going to analyze what the determined Exclusive Economic Zones (EEZ) are on the West Coast of the United States that would be best suited to developing marine aquaculture for that species of interest.
+
+
+### Data
+
+When considering suitability for marine aquaculture of a specific species, we need to consider two primary conditions: Depth and Temperature. When finding suitable EEZ regions, we are going to need data on the depth and surface temperature details (datasets 1 and 2). We can then find suitable regions using the Exclusive Economic Zones (dataset 3), which are specific zones that the United States and coastal nations have rights and jurisdiction over the resources in those waters. More details can be found in the shared link above.
+
+**Dataset 1: Sea Surface Temperature**
+
+This data is average annual sea surface temperature (SST) from the years 2008 to 2012. This will be used to characterize the average sea surface temperature within the EEZ region.To find the averages for each year, I created a raster stack of each year titled `sst` (sea surface temperature).
+
+This data was generated from [NOAA's 5km Daily Global Satellite Sea Surface Temperature Anomaly v3.1](https://coralreefwatch.noaa.gov/product/5km/index_5km_ssta.php)
+
+**Dataset 2: Bathymetry**
+
+This data is raster data characterizing the depth of the ocean, defined as a raster titled `depth`.
+
+This data was generated from [General Bathymetric Chart of the Oceans (GEBCO)](https://www.gebco.net/data_and_products/gridded_bathymetry_data/#area).
+
+**Dataset 3: Exclusive Economic Zones**
+
+To narrow the focus for this analysis, I will just be focusing on West Coast US Exclusive Economic Zones.
+
+This data was used as a shapefile titled `wc_eez`.
+
+This data was generated from [Marineregions.org](https://www.marineregions.org/eez.php).
+
+
+## My Workflow
+
+#### Importing 
+
+```{r include=TRUE, warning=FALSE, messages=FALSE}
+#Attaching packages
+library(terra)
+library(dplyr)
+library(spData)
+library(spDataLarge)
+library(tmap)
+library(geodata)
+library(stars)
+library(here)
+library(sf)
+library(ggplot2)
+library(sp)
+library(leaflet)
+library(raster)
+library(gridExtra)
+```
+
+First, I'm going to read in my raster and shapefile data on yearly sea surface temperature, bathymetry to understand depth, and a shapefile of the West Coast EEZ regions.
+
+```{r}
+# Reading in the shapefile for the West Coast EEZ
+wc_eez <- st_read(here('./data/wc_regions_clean.shp'))
+
+# Reading in SST rasters from 2008-2012
+r1 <- rast("data/average_annual_sst_2008.tif")
+r2 <- rast("data/average_annual_sst_2009.tif")
+r3 <- rast("data/average_annual_sst_2010.tif")
+r4 <- rast("data/average_annual_sst_2011.tif")
+r5 <- rast("data/average_annual_sst_2012.tif")
+
+sst <- c(r1, r2, r3, r4, r5) #stacking the rasters
+
+# Reading in bathymetry raster 
+depth <- rast(here("data", "depth.tif"))
+
+# Doing a check to make sure data are in the same coordinate reference system
+print(crs(sst))
+print(crs(wc_eez))
+print(crs(depth))
+
+#I noticed that sst does not have a crs, so I'm going to choose the 4326 crs to match the wc_eez and depth rasters
+
+#Reproject so all my data is in the same projection
+sst <- project(sst, "EPSG:4326")
+st_crs(wc_eez) == st_crs(sst)
+st_crs(depth) == st_crs(sst)
+```
+
+#### Processing 
+Next, I need to process the SST and depth data so that they can be combined for the analysis step. In this case the SST and depth data have slightly different resolutions, extents, and positions. To make these match, I'm going to resample to match the SST data using the nearest neighbor approach and do some checks before I can use this data.
+    
+```{r include=TRUE}
+# 1. Finding the mean SST
+sst_mean <- app(sst, fun = "mean")
+plot(sst_mean)
+
+# 2. Converting from kelvin to Celsius
+sst_mean_cel <- sst_mean - 273.15
+
+# 3. Checking it changed by plotting the data and evaluating the scale
+plot(sst_mean_cel)
+
+# 4. Cropping depth to match my SST mean data
+new_depth <- crop(depth, sst_mean_cel)
+
+# 5. Resampling my SST and depth data using nearest neighbor
+new_depth_resample <- resample(new_depth, y = sst, method = "near")
+
+# 6. To check this worked, I'm going to check the crs's and the resolutions:
+crs(new_depth_resample) == crs(sst_mean_cel) #checking the crs's match
+plot(new_depth_resample) #I can see the resolutions are the same
+```
+
+#### Specifying Suitable Conditions for My Species
+Next, in order to find suitable locations for marine aquaculture, I need to find locations that are suitable in terms of both SST and depth.Based on previous research, given I am going to focus on oyster species, I found the following conditions for oyster's optimal growth:\
+
+-   sea surface temperature: 11-30&deg;C\
+-   depth: 0-70 meters below sea level
+
+I'm going to find the suitable locations by reclassifying the sea surface temperature and depth data to find locations that satisfy both conditions (listed above). This will allow me to narrow down my area of suitability in the West Coast EEZ zones.  
+```{r include=TRUE}
+#Creating a reclassification matrix for temperature using the suitable oyster temps (11 - 30 degrees Celsius)
+rcl_ <- matrix(c(-Inf, 11, NA,
+                11,30, 1,
+                30, Inf, NA),
+              ncol = 3, byrow = TRUE)
+
+#Reclassifying my SST raster to my new suitable one
+sst_temp_rcl <- classify(sst_mean_cel, rcl = rcl_)
+plot(sst_temp_rcl) #checking the output
+
+#Creating a reclassification matrix for sea level depth using the suitable oyster depths (0-70 meters below sea level)
+#Assumption: sea level is 0 so anything below sea level is negative
+rcl_d <- matrix(c(-Inf, -70, NA,
+                  -70,0,1,
+                  0,Inf,NA),
+                  ncol = 3, byrow = TRUE)
+
+#Reclassifying my sea depth level raster to my new suitable one
+sst_depth_rcl <- classify(new_depth_resample, rcl = rcl_d)
+plot(sst_depth_rcl) #checking the output
+
+#Finding locations that satisfy both SST and depth conditions
+suitable_locations <- lapp(c(sst_depth_rcl, sst_temp_rcl), "*")
+plot(suitable_locations)
+```
+
+#### Determining the Most Suitable EEZ Region(s) for my Species
+I want to determine the total suitable area within each EEZ zone by finding the overlap where suitable locations for oysters currently exist. To do this, I need to create a raster that meets the suitable needs in the West Coast EEZ zones and also add a percentage area calculation to my suitable raster. 
+
+```{r include=TRUE}
+# 1. First, selecting suitable cells within West Coast EEZ
+suitable_regions <- crop(suitable_locations, wc_eez)
+suitable_regions <- mask(suitable_regions, wc_eez)
+
+# 2. Now doing a quick check the suitable regions is a smaller area than locations
+freq(suitable_locations)
+freq(suitable_regions)
+
+# 3. Finding the total area of my suitable_regions for my percentage calculation
+area_grid <- expanse(suitable_regions)
+print(area_grid) #checking this is one number
+  
+# 4. Finding the total suitable area within each of the EEZ regions:
+eez_raster <- rasterize(wc_eez, suitable_regions, field = "rgn")
+plot(eez_raster) #Checking I have a raster of regions
+
+# 5. Calculating the area percent as another component to my suitable area:
+suitable_area <- cross_join(wc_eez, area_grid) %>% 
+  mutate(area_perc = (area/ area_m2)* 100 )
+plot(suitable_area)#Doing a check to make sure area percent was added and calculated correctly
+```
+    
+#### Mapping 
+
+Now that I have the suitable area in meters^2 and the percentage suitable area for oysters in my area of interest, I can map this data in order to visualize where on the West Coast EEZ zones it would be best to consider aquaculture of oyster species.
+```{r include=TRUE}
+#Creating a map for total suitable area by region
+tm_shape(suitable_area) +
+  tm_fill("area_km2",palette = (c("#90e0ef", "#48cae4", "#00b4d8", 
+                          "#0096c7", "#0077b6", "#023e8a")), title = "Area of Suitable Habitat (m^2) by EEZ Region") +
+  tm_layout("Suitable Area for Oysters by EEZ Region", legend.outside = TRUE) +
+   tm_borders (col = "gray") +
+  tm_basemap("OpenStreetMap")
+```
+
+```{r}
+#Creating a map for percentage of total suitable area by region
+tm_shape(suitable_area) +
+  tm_fill("area_perc",palette = "Purples", title = "Percentage of Suitable Area by EEZ Region") +
+  tm_layout("Suitable Percentage of Area for Oysters by EEZ Region", legend.outside = TRUE) +
+   tm_borders (col = "gray") +
+  tm_basemap("OpenStreetMap")
+
+```
+
+
+#### Making this Reproducible 
+
+Now that I've tested my entire workflow on one species, I want to make this easily reproducible for any species of my choosing. To do this, I'm going to create a function that allows me to generate results for any species. This function is going to accept species name, temperature, and depth ranges and output maps of total suitable area and the percent suitable area per EEZ in order to understand potential areas for marine aquaculture. 
+
+```{r}
+species_function = function(species_name, min_temp, max_temp, min_depth, max_depth){
+
+# read in the shapefile for the West Coast EEZ
+wc_eez <- st_read(here('./data/wc_regions_clean.shp'))
+
+# read in your SST rasters
+# read in SST rasters
+r1 <- rast("data/average_annual_sst_2008.tif")
+r2 <- rast("data/average_annual_sst_2009.tif")
+r3 <- rast("data/average_annual_sst_2010.tif")
+r4 <- rast("data/average_annual_sst_2011.tif")
+r5 <- rast("data/average_annual_sst_2012.tif")
+
+sst <- c(r1, r2, r3, r4, r5)
+
+# Read in bathymetry raster (`depth.tif`)
+depth <- rast(here("data", "depth.tif"))
+
+# reproject any data not in the same projection
+sst <- project(sst, "EPSG:4326")
+st_crs(wc_eez) == st_crs(sst)
+st_crs(depth) == st_crs(sst)
+
+#Finding the mean SST
+sst_mean <- app(sst, fun = "mean")
+#Converting SST from kelvin to Celsius
+sst_mean_cel <- sst_mean - 273.15
+
+#Cropping depth to match extent of SST 
+new_depth <- crop(depth, sst_mean_cel)
+
+#Resampling the depth data to match SST using nearest neighbor
+new_depth_resample <- resample(new_depth, y = sst, method = "near")
+
+#Reclassifying for sea surface temperature depending on species suitable conditions 
+rcl_sst <- matrix(c(-Inf, min_temp, NA,
+                min_temp,max_temp, 1,
+                max_temp, Inf, NA),
+              ncol = 3, byrow = TRUE)
+
+#reclassifing the sst raster
+sst_temp_rcl <- classify(sst_mean_cel, rcl = rcl_sst)
+
+
+#Reclassifying for sea level depth depending on species suitable conditions 
+#Assumption: sea level is 0 so anything below sea level is negative
+max_depth <- -(max_depth) #converting max depth to negative, representative of this assumption
+
+rcl_d <- matrix(c(max_depth,min_depth,1,
+                      -Inf, max_depth, NA,
+                      min_depth,Inf,NA),
+                    ncol = 3, byrow = TRUE)
+
+#reclassifying sea depth level raster 
+sst_depth_rcl <- classify(new_depth_resample, rcl = rcl_d)
+
+#Finding locations that satisfy both SST and depth conditions
+suitable_locations <- lapp(c(sst_depth_rcl, sst_temp_rcl), "*")
+
+
+#Next finding suitable cells within WC_EEZ:
+suitable_regions <- crop(suitable_locations, wc_eez)
+suitable_regions <- mask(suitable_regions, wc_eez)
+
+#Finding the total area of grid cells:
+area_grid <- expanse(suitable_regions)
+
+#Finding total suitable area within EEZ:
+eez_raster <- rasterize(wc_eez, suitable_regions, field = "rgn")
+
+#Adding the area percent as another component to suitable area:
+suitable_area <- cross_join(wc_eez, area_grid) %>% 
+  mutate(area_perc = (area/ area_m2)* 100 )
+
+#Creating map for total suitable area by region
+map1 <- 
+  tm_shape(suitable_area) +
+  tm_fill("area_km2",palette = (c("#90e0ef", "#48cae4", "#00b4d8", 
+                          "#0096c7", "#0077b6", "#023e8a")), title = "Area of Suitable Habitat (km^2) by EEZ Region") +  tm_layout("Suitable Area for Oysters by EEZ Region", legend.outside = TRUE) +
+   tm_borders(col = "gray") +
+  tm_basemap("OpenStreetMap") 
+  
+print(map1)  
+#Creating map for percentage of total suitable area by region
+
+map2 <-
+  tm_shape(suitable_area) +
+  tm_fill("area_perc",palette = "Purples", title = "Percentage of Suitable Area by EEZ Region") +
+  tm_layout("Suitable Percentage of Area for Oysters by EEZ Region", legend.outside = TRUE) +
+   tm_borders(col = "gray") +
+  tm_basemap("OpenStreetMap")
+
+print(map2)
+}
+
+```
+
+#### Utilizing my Function
+
+Now, I can select a species of my choosing and run my function to explore suitable areas of the West Coast EEZ zones where my species could grow and be suitable for aquaculture. I utilized species information on depth and temperature requirements, found on [SeaLifeBase](https://www.sealifebase.ca/search.php). 
+
+```{r}
+#Checking suitable areas for the Sharkclub Octopus:
+species_function('Sharkclub Octopus', 12.2, 19, 188, 430)
+```
+
+#### Sources
+
+[^hall]:Hall, S. J., Delaporte, A., Phillips, M. J., Beveridge, M. & O’Keefe, M. Blue Frontiers: Managing the Environmental Costs of Aquaculture (The WorldFish Center, Penang, Malaysia, 2011). 
+
+[^gentry]:Gentry, R. R., Froehlich, H. E., Grimm, D., Kareiva, P., Parke, M., Rust, M., Gaines, S. D., & Halpern, B. S. Mapping the global potential for marine aquaculture. *Nature Ecology & Evolution*, 1, 1317-1324 (2017).
+
+[^gebco]:GEBCO Compilation Group (2022) GEBCO_2022 Grid (doi:10.5285/e0f0bb80-ab44-2739-e053-6c86abc0289c).
